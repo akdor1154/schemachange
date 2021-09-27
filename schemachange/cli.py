@@ -13,6 +13,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import dsa
 from cryptography.hazmat.primitives import serialization
+import io
 
 # Set a few global variables here
 _schemachange_version = '3.1.0'
@@ -37,12 +38,12 @@ class JinjaExpressionTemplate(string.Template):
     )
     '''
 
-def schemachange(config_folder, root_folder, snowflake_account, snowflake_user, snowflake_role, snowflake_warehouse, snowflake_database, change_history_table_override, vars, create_change_history_table, autocommit, verbose, dry_run):
+def schemachange(config_folder, root_folder, snowflake_account, snowflake_user, snowflake_role, snowflake_warehouse, snowflake_database, change_history_table_override, vars, create_change_history_table, autocommit, verbose, dry_run, explain_first):
   print("schemachange version: %s" % _schemachange_version)
 
   # First get the config values
   config_file_path = os.path.join(config_folder, _config_file_name)
-  config = get_schemachange_config(config_file_path, root_folder, snowflake_account, snowflake_user, snowflake_role, snowflake_warehouse, snowflake_database, change_history_table_override, vars, create_change_history_table, autocommit, verbose, dry_run)
+  config = get_schemachange_config(config_file_path, root_folder, snowflake_account, snowflake_user, snowflake_role, snowflake_warehouse, snowflake_database, change_history_table_override, vars, create_change_history_table, autocommit, verbose, dry_run, explain_first)
   if not config['snowflake-account'] or not config['snowflake-user'] or not config['snowflake-role'] or not config['snowflake-warehouse']:
     raise ValueError("Missing config values. The following config values are required: snowflake-account, snowflake-user, snowflake-role, snowflake-warehouse")
 
@@ -150,6 +151,9 @@ def schemachange(config_folder, root_folder, snowflake_account, snowflake_user, 
         scripts_skipped += 1
         continue
 
+    if config['explain-first']:
+      explain_change_script(script, config['vars'], config['snowflake-database'], snowflake_session_parameters, config['autocommit'], config['verbose'])
+
     print("Applying change script %s" % script['script_name'])
     if not config['dry-run']:
       apply_change_script(script, config['vars'], config['snowflake-database'], change_history_table, snowflake_session_parameters, config['autocommit'], config['verbose'])
@@ -171,7 +175,7 @@ def get_alphanum_key(key):
 def sorted_alphanumeric(data):
   return sorted(data, key=get_alphanum_key)
 
-def get_schemachange_config(config_file_path, root_folder, snowflake_account, snowflake_user, snowflake_role, snowflake_warehouse, snowflake_database, change_history_table_override, vars, create_change_history_table, autocommit, verbose, dry_run):
+def get_schemachange_config(config_file_path, root_folder, snowflake_account, snowflake_user, snowflake_role, snowflake_warehouse, snowflake_database, change_history_table_override, vars, create_change_history_table, autocommit, verbose, dry_run, explain_first):
   config = dict()
 
   # First read in the yaml config file, if present
@@ -243,6 +247,11 @@ def get_schemachange_config(config_file_path, root_folder, snowflake_account, sn
     config['dry-run'] = dry_run
   if 'dry-run' not in config:
     config['dry-run'] = False
+
+  if explain_first:
+    config['explain-first'] = explain_first
+  if 'explain-first' not in config:
+    config['explain-first'] = False
 
   return config
 
@@ -500,6 +509,20 @@ def apply_change_script(script, vars, default_database, change_history_table, sn
   query = "INSERT INTO {0}.{1} (VERSION, DESCRIPTION, SCRIPT, SCRIPT_TYPE, CHECKSUM, EXECUTION_TIME, STATUS, INSTALLED_BY, INSTALLED_ON) values ('{2}','{3}','{4}','{5}','{6}',{7},'{8}','{9}',CURRENT_TIMESTAMP);".format(change_history_table['schema_name'], change_history_table['table_name'], script['script_version'], script['script_description'], script['script_name'], script['script_type'], checksum, execution_time, status, os.environ["SNOWFLAKE_USER"])
   execute_snowflake_query(change_history_table['database_name'], query, snowflake_session_parameters, autocommit, verbose)
 
+def explain_change_script(script, vars, default_database, snowflake_session_parameters, verbose):
+  '''
+  Run "explain <statement>" for every <statement> in a script of <statement>; <statement>; ...
+  This will throw an error if the explain fails, which will catch many issues with the script without needing to directly execute it.
+  '''
+  content = get_script_contents_with_variable_replacement(script['script_full_path'], vars, verbose)
+
+  content_io = io.StringIO(content)
+  statements = snowflake.connector.util_text.split_statements(content_io)
+  for s, _ in statements:
+      explain = f"explain {s}"
+      execute_snowflake_query(default_database, explain, snowflake_session_parameters, False, verbose)
+
+
 # This method will throw an error if there are any leftover variables in the change script
 # Since a leftover variable in the script isn't valid SQL, and will fail when run it's
 # better to throw an error here and have the user fix the problem ahead of time.
@@ -523,9 +546,10 @@ def main():
   parser.add_argument('-ac', '--autocommit', action='store_true', help = 'Enable autocommit feature for DML commands (the default is False)', required = False)
   parser.add_argument('-v','--verbose', action='store_true', help = 'Display verbose debugging details during execution (the default is False)', required = False)
   parser.add_argument('--dry-run', action='store_true', help = 'Run schemachange in dry run mode (the default is False)', required = False)
+  parser.add_argument('--explain-first', action='store_true', help = 'Run explain <statement> before each query is run properly, which can be used to pre-validate validate syntax etc. Works with most, but not all, Snowflake statements.')
   args = parser.parse_args()
 
-  schemachange(args.config_folder, args.root_folder, args.snowflake_account, args.snowflake_user, args.snowflake_role, args.snowflake_warehouse, args.snowflake_database, args.change_history_table, args.vars, args.create_change_history_table, args.autocommit, args.verbose, args.dry_run)
+  schemachange(args.config_folder, args.root_folder, args.snowflake_account, args.snowflake_user, args.snowflake_role, args.snowflake_warehouse, args.snowflake_database, args.change_history_table, args.vars, args.create_change_history_table, args.autocommit, args.verbose, args.dry_run, args.explain_first)
 
 if __name__ == "__main__":
     main()
